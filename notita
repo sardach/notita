@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+if [ "$#" -eq 0 ]; then
+  echo "Uso: $0 \"texto\""
+  exit 1
+fi
+
+MESSAGE="$1"
+
+(
+python3 - "$MESSAGE" <<'PY'
+import sys
+import tkinter as tk
+
+message = sys.argv[1]
+root = tk.Tk()
+root.attributes("-topmost", True)
+root.configure(bg="black")
+canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+canvas.pack(fill="both", expand=True)
+text_item = canvas.create_text(0, 0, text=message, anchor="w", fill="white", font=("Helvetica", 24))
+canvas.update_idletasks()
+bbox = canvas.bbox(text_item)
+text_width = bbox[2] - bbox[0]
+text_height = bbox[3] - bbox[1]
+window_width = 400
+window_height = text_height
+root.geometry(f"{window_width}x{window_height}+100+100")
+canvas.coords(text_item, window_width, window_height // 2)
+
+
+def tick():
+    x, y = canvas.coords(text_item)
+    if x < -text_width:
+        canvas.coords(text_item, window_width, y)
+    else:
+        canvas.move(text_item, -2, 0)
+    root.after(30, tick)
+
+
+tick()
+root.mainloop()
+PY
+) & disown
