@@ -1,43 +1,29 @@
-#!/usr/bin/env bash
-if [ "$#" -eq 0 ]; then
-  echo "Uso: $0 \"texto\""
-  exit 1
-fi
+#!/usr/bin/env python3
+from __future__ import annotations
 
-MESSAGE="$1"
-
-(
-python3 - "$MESSAGE" <<'PY'
 import sys
 import tkinter as tk
+from tkinter import simpledialog
 
-message = sys.argv[1]
+
+text = " ".join(sys.argv[1:]).strip()
+if not text:
+    prompt = tk.Tk()
+    prompt.withdraw()
+    prompt.attributes("-topmost", True)
+    text = simpledialog.askstring("Notita", "Texto:", parent=prompt) or ""
+    prompt.destroy()
+
+if not text:
+    raise SystemExit(0)
+
 root = tk.Tk()
 root.attributes("-topmost", True)
-root.configure(bg="black")
-canvas = tk.Canvas(root, bg="black", highlightthickness=0)
-canvas.pack(fill="both", expand=True)
-text_item = canvas.create_text(0, 0, text=message, anchor="w", fill="white", font=("Helvetica", 24))
-canvas.update_idletasks()
-bbox = canvas.bbox(text_item)
-text_width = bbox[2] - bbox[0]
-text_height = bbox[3] - bbox[1]
-window_width = 400
-window_height = text_height
-root.geometry(f"{window_width}x{window_height}+100+100")
-canvas.coords(text_item, window_width, window_height // 2)
+root.geometry("260x140+120+120")
 
+box = tk.Text(root, wrap="word", font=("Sans", 10), padx=8, pady=8)
+box.pack(fill="both", expand=True)
+box.insert("1.0", text)
+box.focus_set()
 
-def tick():
-    x, y = canvas.coords(text_item)
-    if x < -text_width:
-        canvas.coords(text_item, window_width, y)
-    else:
-        canvas.move(text_item, -2, 0)
-    root.after(30, tick)
-
-
-tick()
 root.mainloop()
-PY
-) & disown
