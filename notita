@@ -3,27 +3,73 @@ from __future__ import annotations
 
 import sys
 import tkinter as tk
-from tkinter import simpledialog
 
 
-text = " ".join(sys.argv[1:]).strip()
-if not text:
-    prompt = tk.Tk()
-    prompt.withdraw()
-    prompt.attributes("-topmost", True)
-    text = simpledialog.askstring("Notita", "Texto:", parent=prompt) or ""
-    prompt.destroy()
-
-if not text:
-    raise SystemExit(0)
+text = " ".join(sys.argv[1:])
 
 root = tk.Tk()
 root.attributes("-topmost", True)
-root.geometry("260x140+120+120")
+root.attributes("-alpha", 0.72)
+root.configure(bg="#d7d7d7")
 
-box = tk.Text(root, wrap="word", font=("Sans", 10), padx=8, pady=8)
+width, height = 140, 70
+px = root.winfo_pointerx()
+py = root.winfo_pointery()
+sw = root.winfo_screenwidth()
+sh = root.winfo_screenheight()
+if px > 1 and py > 1:
+    x = max(0, min(px - width // 2, sw - width))
+    y = max(0, min(py - height // 2, sh - height))
+else:
+    x = max(0, (sw - width) // 2)
+    y = max(0, (sh - height) // 2)
+root.geometry(f"{width}x{height}+{x}+{y}")
+
+box = tk.Text(
+    root,
+    wrap="word",
+    font=("Sans", 9),
+    padx=6,
+    pady=4,
+    bg="#d7d7d7",
+    fg="#2f2f2f",
+    relief="flat",
+    bd=0,
+    insertbackground="#5d5d5d",
+)
 box.pack(fill="both", expand=True)
-box.insert("1.0", text)
-box.focus_set()
+if text:
+    box.insert("1.0", text)
+
+resize = tk.Frame(root, bg="#8a8a8a", width=10, height=10, cursor="bottom_right_corner")
+resize.place(relx=1.0, rely=1.0, anchor="se")
+
+drag_offset = [0, 0]
+resize_state = [0, 0, width, height]
+
+
+def drag_start(event):
+    drag_offset[0] = event.x_root - root.winfo_x()
+    drag_offset[1] = event.y_root - root.winfo_y()
+
+
+def drag_move(event):
+    root.geometry(f"+{event.x_root - drag_offset[0]}+{event.y_root - drag_offset[1]}")
+
+
+def resize_start(event):
+    resize_state[:] = [event.x_root, event.y_root, root.winfo_width(), root.winfo_height()]
+
+
+def resize_move(event):
+    sx, sy, sw, sh = resize_state
+    root.geometry(f"{max(140, sw + event.x_root - sx)}x{max(70, sh + event.y_root - sy)}")
+
+
+box.bind("<Alt-ButtonPress-1>", drag_start)
+box.bind("<Alt-B1-Motion>", drag_move)
+resize.bind("<ButtonPress-1>", resize_start)
+resize.bind("<B1-Motion>", resize_move)
+root.after(10, lambda: (root.lift(), root.focus_force(), box.focus_force(), box.mark_set("insert", "end")))
 
 root.mainloop()

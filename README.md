@@ -1,10 +1,9 @@
 # Notita
 
-Utilidad minima para abrir una nota flotante editable.
+Nota flotante discreta para escritorio Linux.
 
-## Uso
+## Principios
 
-```bash
-notita
-notita "texto inicial"
-```
+- siempre encima
+- visual sobria
+- mover y redimensionar rapido
