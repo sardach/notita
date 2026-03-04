@@ -18,3 +18,5 @@ notita --read-only
 - historial local con restauracion
 - menu contextual para colores, fuente, opacidad y tamano
 - grip para mover y grip para resize
+- bloqueo de edicion y control de tipografia en caliente
+- topmost activo por defecto
