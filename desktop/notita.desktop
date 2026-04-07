@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Notita
+GenericName=Nota flotante
+Comment=Notas flotantes discretas y persistentes para el escritorio
+Exec=/home/chema/.local/bin/notita
+Icon=notita
+Terminal=false
+Categories=Utility;Office;
+Keywords=nota;notas;sticky;floating;memo;
+StartupNotify=true
+SingleMainWindow=false
