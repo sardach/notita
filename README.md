@@ -16,10 +16,18 @@ Alt + Shift + N
 
 ## Componentes
 
-- Aplicacion principal instalada: `~/.local/bin/notita`
+- Comando instalado: `~/.local/bin/notita`
+- Wrapper del proyecto: `notita`
+- Aplicacion principal: `src/notita`
 - Lanzador de menu: `~/.local/share/applications/notita.desktop`
 - Icono: `~/.local/share/icons/hicolor/scalable/apps/notita.svg`
 - Estado persistente: `~/.local/state/notita/history.json`
+
+## Instalacion local
+
+```bash
+./install-local.sh
+```
 
 ## Comportamiento
 

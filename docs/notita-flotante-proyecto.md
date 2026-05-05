@@ -7,6 +7,8 @@ Crear una utilidad invocable por comando/atajo para capturar texto rápido y mos
 
 ## Entregables
 - Comando unico: `/home/chema/.local/bin/notita`
+- Fuente principal del proyecto: `/home/chema/proyectos/notita/src/notita`
+- Wrapper estable del proyecto: `/home/chema/proyectos/notita/notita`
 - Atajo Openbox: `Alt+Shift+N` (`A-S-n`)
 
 ## Comportamiento
