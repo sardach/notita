@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir="$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+script_dir="$(
+  CDPATH=
+  cd -- "$(dirname -- "$(readlink -f -- "$0")")"
+  pwd
+)"
+if [ -x "$script_dir/.venv/bin/python" ]; then
+  exec "$script_dir/.venv/bin/python" "$script_dir/src/notita" "$@"
+fi
 exec "$script_dir/src/notita" "$@"

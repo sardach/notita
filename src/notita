@@ -4,22 +4,55 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import colorchooser, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
+
+from PIL import Image, ImageSequence, ImageTk
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+
+try:
+    from Xlib import X, display as xdisplay
+    from Xlib.ext import shape
+except ImportError:
+    X = None
+    xdisplay = None
+    shape = None
 
 STATE_DIR = Path.home() / ".local" / "state" / "notita"
+IMAGE_DIR = STATE_DIR / "images"
 HISTORY_FILE = STATE_DIR / "history.json"
 LOCK_FILE = STATE_DIR / "history.lock"
+
+STYLE_TAGS = (
+    "fmt_bold",
+    "fmt_italic",
+    "fmt_underline",
+    "fmt_strike",
+    "fmt_code",
+    "fmt_highlight",
+    "fmt_big",
+    "fmt_small",
+    "fmt_title",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fg", default="#2f2f2f")
     parser.add_argument("--font-size", type=int, default=9)
     parser.add_argument("--font-family", default="Sans")
+    parser.add_argument("--format-json", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--images-json", default="", help=argparse.SUPPRESS)
     parser.add_argument("--read-only", action="store_true", help="Abrir sin modo edicion")
+    parser.add_argument("--click-through", action="store_true", help="Dejar pasar clics a ventanas debajo (X11)")
     parser.add_argument("--frameless", action="store_true", help="Sin decoraciones (puede romper escritura en Linux)")
     parser.add_argument("--topmost", dest="topmost", action="store_true", default=True)
     parser.add_argument("--no-topmost", dest="topmost", action="store_false")
@@ -125,13 +161,324 @@ def spawn_note_from_record(record: dict) -> None:
         str(int(record.get("font_size", 9))),
         "--font-family",
         str(record.get("font_family", "Sans")),
+        "--format-json",
+        json.dumps(record.get("format", []), ensure_ascii=False),
+        "--images-json",
+        json.dumps(record.get("images", []), ensure_ascii=False),
         str(record.get("text", "")),
     ]
     if record.get("topmost"):
         cmd.append("--topmost")
     if record.get("read_only"):
         cmd.append("--read-only")
+    if record.get("click_through"):
+        cmd.append("--click-through")
     subprocess.Popen(cmd, start_new_session=True)
+
+
+class X11InputShape:
+    def __init__(self) -> None:
+        self.display = None
+        if xdisplay is None or shape is None or X is None or not os.environ.get("DISPLAY"):
+            return
+        try:
+            candidate = xdisplay.Display()
+            if candidate.has_extension("SHAPE"):
+                candidate.set_error_handler(lambda *_: None)
+                self.display = candidate
+            else:
+                candidate.close()
+        except Exception:
+            self.display = None
+
+    @property
+    def available(self) -> bool:
+        return self.display is not None
+
+    def set_passthrough(self, root: tk.Misc, enabled: bool, control_widgets: set[tk.Misc] | None = None) -> bool:
+        if self.display is None:
+            return False
+        control_widgets = control_widgets or set()
+        try:
+            root.update_idletasks()
+            for widget in self._walk_widgets(root):
+                if not enabled:
+                    self._set_widget_input(widget, self._widget_rects(widget))
+                elif widget == root:
+                    self._set_widget_input(widget, self._control_rects(root, control_widgets))
+                elif widget in control_widgets:
+                    self._set_widget_input(widget, self._widget_rects(widget))
+                else:
+                    self._set_widget_input(widget, [])
+            self.display.sync()
+            return True
+        except Exception:
+            return False
+
+    def _walk_widgets(self, widget: tk.Misc) -> list[tk.Misc]:
+        if isinstance(widget, tk.Menu):
+            return []
+        widgets = [widget]
+        for child in widget.winfo_children():
+            widgets.extend(self._walk_widgets(child))
+        return widgets
+
+    def _widget_rects(self, widget: tk.Misc) -> list[tuple[int, int, int, int]]:
+        return [(0, 0, max(1, widget.winfo_width()), max(1, widget.winfo_height()))]
+
+    def _control_rects(self, root: tk.Misc, control_widgets: set[tk.Misc]) -> list[tuple[int, int, int, int]]:
+        rects = []
+        root_x = root.winfo_rootx()
+        root_y = root.winfo_rooty()
+        for widget in control_widgets:
+            rects.append(
+                (
+                    widget.winfo_rootx() - root_x,
+                    widget.winfo_rooty() - root_y,
+                    max(1, widget.winfo_width()),
+                    max(1, widget.winfo_height()),
+                )
+            )
+        return rects
+
+    def _set_widget_input(self, widget: tk.Misc, rects: list[tuple[int, int, int, int]]) -> None:
+        win_id = widget.winfo_id()
+        if not win_id:
+            return
+        for win in self._window_chain(win_id, widget == widget.winfo_toplevel()):
+            win.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, rects)
+
+    def _window_chain(self, win_id: int, include_parents: bool) -> list:
+        win = self.display.create_resource_object("window", win_id)
+        windows = [win]
+        if not include_parents:
+            return windows
+        while True:
+            tree = win.query_tree()
+            parent = tree.parent
+            if parent.id == tree.root.id:
+                return windows
+            windows.append(parent)
+            win = parent
+
+
+class FloatingImage:
+    def __init__(self, note: GhostNote, record: dict) -> None:
+        self.note = note
+        self.image_id = str(record.get("id") or uuid.uuid4().hex)
+        self.path = str(record.get("path") or "")
+        self.store_path = str(record.get("store_path") or "")
+        self.data = str(record.get("data") or "")
+        self.name = str(record.get("name") or Path(self.path).name or "imagen")
+        self.x = int(record.get("x", 12))
+        self.y = int(record.get("y", 24))
+        self.width = max(24, int(record.get("width", 160)))
+        self.height = max(24, int(record.get("height", 120)))
+        self.drag_start = (0, 0, self.x, self.y)
+        self.resize_start = (0, 0, self.width, self.height)
+        self.frame = tk.Frame(note.body, bg="#f4f4f4", highlightthickness=1, highlightbackground="#666666", bd=0)
+        self.label = tk.Label(self.frame, bg="#f4f4f4", bd=0)
+        self.label.pack(fill="both", expand=True)
+        self.grip = tk.Frame(self.frame, bg="#555555", width=10, height=10, cursor="bottom_right_corner")
+        self.grip.place(relx=1.0, rely=1.0, anchor="se")
+        self.frames: list[Image.Image] = []
+        self.photo: ImageTk.PhotoImage | None = None
+        self.frame_index = 0
+        self.animation_job: str | None = None
+        self._materialize_embedded_data()
+        self._load_frames()
+        self._bind_events()
+        self.place()
+        self.render()
+
+    def _materialize_embedded_data(self) -> None:
+        if self.store_path or not self.data:
+            return
+        try:
+            raw = base64.b64decode(self.data)
+        except Exception:
+            return
+        suffix = Path(self.path).suffix.lower() or ".img"
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        store_path = IMAGE_DIR / f"{self.image_id}{suffix}"
+        store_path.write_bytes(raw)
+        self.store_path = str(store_path)
+        self.data = ""
+
+    @classmethod
+    def from_file(cls, note: GhostNote, path: str, x: int = 16, y: int = 28) -> FloatingImage:
+        raw = Path(path).read_bytes()
+        image_id = uuid.uuid4().hex
+        suffix = Path(path).suffix.lower() or ".img"
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        store_path = IMAGE_DIR / f"{image_id}{suffix}"
+        store_path.write_bytes(raw)
+        with Image.open(io.BytesIO(raw)) as img:
+            w, h = img.size
+        max_w = max(80, note.root.winfo_width() - 28)
+        max_h = max(80, note.root.winfo_height() - 48)
+        scale = min(1.0, max_w / max(1, w), max_h / max(1, h))
+        return cls(
+            note,
+            {
+                "id": image_id,
+                "path": path,
+                "store_path": str(store_path),
+                "name": Path(path).name,
+                "x": x,
+                "y": y,
+                "width": max(24, int(w * scale)),
+                "height": max(24, int(h * scale)),
+            },
+        )
+
+    def _load_frames(self) -> None:
+        if self.store_path and Path(self.store_path).exists():
+            raw = Path(self.store_path).read_bytes()
+        elif self.data:
+            raw = base64.b64decode(self.data)
+        else:
+            raw = Path(self.path).read_bytes()
+        with Image.open(io.BytesIO(raw)) as img:
+            self.frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(img)]
+        if not self.frames:
+            raise ValueError("imagen sin frames")
+
+    def _bind_events(self) -> None:
+        for widget in (self.frame, self.label):
+            widget.bind("<ButtonPress-1>", self._start_drag)
+            widget.bind("<B1-Motion>", self._drag)
+            widget.bind("<Button-3>", self._open_menu)
+            widget.bind("<Enter>", self.note._activate_opacity, add="+")
+            widget.bind("<Leave>", self.note._schedule_idle_opacity, add="+")
+        self.grip.bind("<ButtonPress-1>", self._start_resize)
+        self.grip.bind("<B1-Motion>", self._resize)
+        self.grip.bind("<Button-3>", self._open_menu)
+        self.frame.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self.frame and self.animation_job is not None:
+            try:
+                self.note.root.after_cancel(self.animation_job)
+            except tk.TclError:
+                pass
+            self.animation_job = None
+
+    def place(self) -> None:
+        self._clamp_geometry()
+        self.frame.place(x=self.x, y=self.y, width=self.width, height=self.height)
+
+    def _clamp_geometry(self) -> None:
+        body_w = self.note.body.winfo_width()
+        body_h = self.note.body.winfo_height()
+        max_w = max(24, body_w if body_w > 24 else self.note.root.winfo_width())
+        max_h = max(24, body_h if body_h > 24 else self.note.root.winfo_height())
+        self.width = max(24, min(self.width, max_w))
+        self.height = max(24, min(self.height, max_h))
+        self.x = max(0, min(self.x, max(0, max_w - self.width)))
+        self.y = max(0, min(self.y, max(0, max_h - self.height)))
+
+    def render(self) -> None:
+        frame = self.frames[self.frame_index % len(self.frames)]
+        resized = frame.resize((max(1, self.width), max(1, self.height)), Image.Resampling.LANCZOS)
+        self.photo = ImageTk.PhotoImage(resized)
+        self.label.configure(image=self.photo)
+        self._schedule_animation()
+
+    def _schedule_animation(self) -> None:
+        if self.animation_job is not None:
+            self.note.root.after_cancel(self.animation_job)
+            self.animation_job = None
+        if len(self.frames) <= 1:
+            return
+        delay = int(self.frames[self.frame_index % len(self.frames)].info.get("duration", 90) or 90)
+        self.animation_job = self.note.root.after(max(30, delay), self._next_frame)
+
+    def _next_frame(self) -> None:
+        self.animation_job = None
+        self.frame_index = (self.frame_index + 1) % len(self.frames)
+        self.render()
+
+    def _start_drag(self, event: tk.Event) -> None:
+        self.frame.lift()
+        self.drag_start = (event.x_root, event.y_root, self.x, self.y)
+
+    def _drag(self, event: tk.Event) -> None:
+        sx, sy, ox, oy = self.drag_start
+        self.x = ox + (event.x_root - sx)
+        self.y = oy + (event.y_root - sy)
+        self.place()
+        self.note._schedule_save()
+        self.note._reapply_click_through()
+
+    def _start_resize(self, event: tk.Event) -> None:
+        self.frame.lift()
+        self.resize_start = (event.x_root, event.y_root, self.width, self.height)
+
+    def _resize(self, event: tk.Event) -> None:
+        sx, sy, ow, oh = self.resize_start
+        self.width = ow + (event.x_root - sx)
+        self.height = oh + (event.y_root - sy)
+        self.place()
+        self.render()
+        self.note._schedule_save()
+        self.note._reapply_click_through()
+
+    def _open_menu(self, event: tk.Event) -> str:
+        menu = tk.Menu(self.note.root, tearoff=0)
+        menu.add_command(label="Traer al frente", command=self.frame.lift)
+        menu.add_command(label="Enviar atras", command=lambda: self.note.send_image_back(self))
+        menu.add_command(label="Tamano original", command=self.reset_size)
+        menu.add_command(label="Ajustar a nota", command=self.fit_to_note)
+        menu.add_separator()
+        menu.add_command(label="Eliminar imagen", command=self.delete)
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
+        return "break"
+
+    def reset_size(self) -> None:
+        w, h = self.frames[0].size
+        self.width = max(24, w)
+        self.height = max(24, h)
+        self.place()
+        self.render()
+        self.note._schedule_save()
+        self.note._reapply_click_through()
+
+    def fit_to_note(self) -> None:
+        w, h = self.frames[0].size
+        max_w = max(80, self.note.root.winfo_width() - 28)
+        max_h = max(80, self.note.root.winfo_height() - 48)
+        scale = min(max_w / max(1, w), max_h / max(1, h))
+        self.width = max(24, int(w * scale))
+        self.height = max(24, int(h * scale))
+        self.x = min(self.x, max(0, self.note.root.winfo_width() - self.width))
+        self.y = min(self.y, max(0, self.note.root.winfo_height() - self.height))
+        self.place()
+        self.render()
+        self.note._schedule_save()
+        self.note._reapply_click_through()
+
+    def delete(self) -> None:
+        if self.animation_job is not None:
+            self.note.root.after_cancel(self.animation_job)
+        self.frame.destroy()
+        self.note.images = [image for image in self.note.images if image is not self]
+        self.note._schedule_save()
+        self.note._reapply_click_through()
+
+    def to_record(self) -> dict:
+        return {
+            "id": self.image_id,
+            "path": self.path,
+            "store_path": self.store_path,
+            "name": self.name,
+            "data": "" if self.store_path else self.data,
+            "x": int(self.x),
+            "y": int(self.y),
+            "width": int(self.width),
+            "height": int(self.height),
+        }
 
 
 def handle_restore_option(restore_value: str) -> None:
@@ -172,8 +519,12 @@ def handle_restore_option(restore_value: str) -> None:
 class GhostNote:
     def __init__(self, args: argparse.Namespace, text: str) -> None:
         self.note_id = args.note_id.strip() or uuid.uuid4().hex
-        self.frameless = bool(args.frameless)
+        self.requested_frameless = bool(args.frameless)
+        self.initial_click_through = bool(args.click_through)
         self.root = tk.Tk()
+        self.dnd_available = self._load_tkdnd()
+        self.input_shape = X11InputShape()
+        self.frameless = bool(self.requested_frameless or (self.initial_click_through and self.input_shape.available))
         # En Linux/Openbox, overrideredirect puede bloquear la escritura.
         # Por eso modo normal por defecto; frameless solo bajo demanda.
         self.root.overrideredirect(self.frameless)
@@ -181,7 +532,7 @@ class GhostNote:
 
         self.active_opacity = max(0.35, min(1.0, args.active_opacity))
         self.idle_opacity = max(0.05, min(self.active_opacity, args.idle_opacity))
-        self.root.attributes("-alpha", self.idle_opacity)
+        self._set_opacity(self.idle_opacity)
 
         self.bg = args.bg
         self.fg = args.fg
@@ -216,17 +567,51 @@ class GhostNote:
         self.drag_offset = (0, 0)
         self.resize_start = (0, 0, width, height)
         self._save_job: str | None = None
+        self.has_custom_input_shape = False
 
+        self.initial_format = self._parse_json_list(args.format_json)
+        self.initial_images = self._parse_json_list(args.images_json)
         self.read_only = bool(args.read_only)
+        self.click_through = False
+        self.pending_style_tags: set[str] = set()
+        self.images: list[FloatingImage] = []
+        self.toolbar_visible = False
+        self.toolbar_hide_job: str | None = None
+        self.opacity_idle_job: str | None = None
         self._build_ui(text, read_only=self.read_only)
         self._save_now()
 
+    def _parse_json_list(self, value: str) -> list[dict]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _load_tkdnd(self) -> bool:
+        if TkinterDnD is None:
+            return False
+        try:
+            TkinterDnD._require(self.root)
+        except Exception:
+            return False
+        return True
+
     def _build_ui(self, text: str, read_only: bool = False) -> None:
-        body = tk.Frame(self.root, bg=self.bg, highlightthickness=0, bd=0)
-        body.pack(fill="both", expand=True)
+        self.body = tk.Frame(self.root, bg=self.bg, highlightthickness=0, bd=0)
+        self.body.pack(fill="both", expand=True)
+
+        self.toolbar = tk.Frame(self.body, bg="#c8c8c8", highlightthickness=0, bd=0)
+        self.toolbar_handle = tk.Frame(self.body, bg="#a6a6a6", height=10, cursor="hand2")
+        self.toolbar_handle.pack(fill="x", side="top")
+        self.toolbar_handle.bind("<Enter>", lambda _: self._show_toolbar())
+        self.toolbar.bind("<Enter>", lambda _: self._show_toolbar())
+        self.toolbar.bind("<Leave>", lambda _: self._schedule_toolbar_hide())
 
         self.text_widget = tk.Text(
-            body,
+            self.body,
             bg=self.bg,
             fg=self.fg,
             relief="flat",
@@ -237,15 +622,24 @@ class GhostNote:
             insertbackground="#5d5d5d",
             highlightthickness=0,
             bd=0,
+            undo=True,
+            autoseparators=True,
+            maxundo=120,
         )
         self.text_widget.pack(fill="both", expand=True)
+        self._configure_text_tags()
+        self._build_toolbar()
         if text:
             self.text_widget.insert("1.0", text)
+        self._restore_format_ranges(self.initial_format)
+        self.text_widget.edit_reset()
+        self.text_widget.edit_modified(False)
         if read_only:
             self.text_widget.configure(state="disabled")
         else:
             self.text_widget.configure(state="normal")
             self.text_widget.bind("<Button-1>", lambda _: self.text_widget.focus_force())
+        self._restore_images(self.initial_images)
 
         self.resize_grip = tk.Frame(self.root, bg="#8a8a8a", width=10, height=10, cursor="bottom_right_corner")
         self.resize_grip.place(relx=1.0, rely=1.0, anchor="se")
@@ -267,6 +661,7 @@ class GhostNote:
 
         self.text_widget.bind("<Alt-ButtonPress-1>", self._start_drag)
         self.text_widget.bind("<Alt-B1-Motion>", self._drag)
+        self._bind_text_shortcuts()
         self.move_grip.bind("<ButtonPress-1>", self._start_drag)
         self.move_grip.bind("<B1-Motion>", self._drag)
         self.resize_grip.bind("<ButtonPress-1>", self._start_resize)
@@ -276,19 +671,27 @@ class GhostNote:
         self._build_context_menu()
         self.text_widget.bind("<Button-3>", self._open_context_menu)
         self.root.bind("<Button-3>", self._open_context_menu)
+        self.move_grip.bind("<Button-3>", self._open_context_menu)
+        self.resize_grip.bind("<Button-3>", self._open_context_menu)
 
-        self.root.bind("<Enter>", lambda _: self.root.attributes("-alpha", self.active_opacity))
-        self.root.bind("<Leave>", lambda _: self.root.attributes("-alpha", self.idle_opacity))
-        self.root.bind("<FocusIn>", lambda _: self.root.attributes("-alpha", self.active_opacity))
-        self.root.bind("<FocusOut>", lambda _: self.root.attributes("-alpha", self.idle_opacity))
+        self._bind_presence_events()
+        self._bind_drop_targets()
+        self.root.bind("<FocusIn>", self._activate_opacity, add="+")
+        self.root.bind("<FocusOut>", lambda _: self._set_opacity(self.idle_opacity), add="+")
 
         self.text_widget.bind("<<Modified>>", self._on_text_modified)
-        self.root.bind("<Configure>", lambda _: self._schedule_save())
+        self.root.bind("<Configure>", self._on_configure)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.bind("<Escape>", lambda _: self._close())
         self.root.bind("<Control-q>", lambda _: self._close())
-        # Fuerza foco/edicion al abrir (overrideredirect puede requerir retraso)
-        self.root.after(10, self._force_focus)
+        self.root.bind("<Control-Alt-p>", lambda _: self._set_click_through(False))
+        self.root.after(10, self._finish_open)
+
+    def _finish_open(self) -> None:
+        if self.initial_click_through and self._set_click_through(True):
+            return
+        self._force_focus()
+        self.root.after(80, self._refresh_opacity_for_pointer)
 
     def _force_focus(self) -> None:
         try:
@@ -303,12 +706,441 @@ class GhostNote:
         except tk.TclError:
             return
 
+    def _bind_presence_events(self) -> None:
+        for widget in self._all_note_widgets():
+            widget.bind("<Enter>", self._activate_opacity, add="+")
+            widget.bind("<Leave>", self._schedule_idle_opacity, add="+")
+
+    def _bind_drop_targets(self) -> None:
+        if not self.dnd_available or DND_FILES is None:
+            return
+        for widget in (self.root, self.body, self.text_widget, self.toolbar_handle):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop_files)
+            except (AttributeError, tk.TclError):
+                continue
+
+    def _on_drop_files(self, event: tk.Event) -> str:
+        if self.read_only:
+            return "break"
+        paths = self._paths_from_drop(str(getattr(event, "data", "")))
+        if not paths:
+            return "break"
+        drop_x = int(getattr(event, "x_root", self.body.winfo_rootx() + 16)) - self.body.winfo_rootx()
+        drop_y = int(getattr(event, "y_root", self.body.winfo_rooty() + 28)) - self.body.winfo_rooty()
+        x = max(0, drop_x)
+        y = max(0, drop_y)
+        added = 0
+        for path in paths:
+            if self._add_image_from_path(path, x=x + (added * 12), y=y + (added * 12), quiet=True):
+                added += 1
+        return "break"
+
+    def _paths_from_drop(self, data: str) -> list[str]:
+        paths = []
+        try:
+            raw_items = self.root.tk.splitlist(data)
+        except tk.TclError:
+            raw_items = data.split()
+        for item in raw_items:
+            value = str(item).strip()
+            if not value:
+                continue
+            parsed = urlparse(value)
+            if parsed.scheme == "file":
+                value = unquote(parsed.path)
+            path = Path(value).expanduser()
+            if not path.is_file():
+                continue
+            if self._is_supported_image(path):
+                paths.append(str(path))
+        return paths
+
+    def _is_supported_image(self, path: Path) -> bool:
+        try:
+            with Image.open(path) as img:
+                img.verify()
+        except Exception:
+            return False
+        return True
+
+    def _all_note_widgets(self) -> list[tk.Misc]:
+        widgets = [self.root]
+        for widget in list(widgets):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Menu):
+                    continue
+                widgets.append(child)
+        return widgets
+
+    def _activate_opacity(self, _: tk.Event | None = None) -> None:
+        if self.opacity_idle_job is not None:
+            self.root.after_cancel(self.opacity_idle_job)
+            self.opacity_idle_job = None
+        self._set_opacity(self.active_opacity)
+
+    def _schedule_idle_opacity(self, _: tk.Event | None = None) -> None:
+        if self.opacity_idle_job is not None:
+            self.root.after_cancel(self.opacity_idle_job)
+        self.opacity_idle_job = self.root.after(90, self._idle_opacity_if_pointer_left)
+
+    def _idle_opacity_if_pointer_left(self) -> None:
+        self.opacity_idle_job = None
+        if self._pointer_inside_note():
+            return
+        self._set_opacity(self.idle_opacity)
+
+    def _pointer_inside_note(self) -> bool:
+        widget = self.root.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        return widget is not None and str(widget).startswith(str(self.root))
+
+    def _refresh_opacity_for_pointer(self) -> None:
+        self._set_opacity(self.active_opacity if self._pointer_inside_note() else self.idle_opacity)
+
+    def _set_opacity(self, value: float) -> None:
+        value = max(0.05, min(1.0, float(value)))
+        try:
+            self.root.attributes("-alpha", value)
+        except tk.TclError:
+            return
+
+    def _configure_text_tags(self) -> None:
+        bold_font = tkfont.Font(family=self.font_family, size=self.font_size, weight="bold")
+        italic_font = tkfont.Font(family=self.font_family, size=self.font_size, slant="italic")
+        code_font = tkfont.Font(family="Monospace", size=self.font_size)
+        big_font = tkfont.Font(family=self.font_family, size=min(36, self.font_size + 3))
+        small_font = tkfont.Font(family=self.font_family, size=max(6, self.font_size - 2))
+        title_font = tkfont.Font(family=self.font_family, size=min(42, self.font_size + 7), weight="bold")
+        self.style_fonts = [bold_font, italic_font, code_font, big_font, small_font, title_font]
+        self.text_widget.tag_configure("fmt_bold", font=bold_font)
+        self.text_widget.tag_configure("fmt_italic", font=italic_font)
+        self.text_widget.tag_configure("fmt_underline", underline=True)
+        self.text_widget.tag_configure("fmt_strike", overstrike=True)
+        self.text_widget.tag_configure("fmt_code", font=code_font, background="#eeeeee", foreground="#222222")
+        self.text_widget.tag_configure("fmt_highlight", background="#fff2a8")
+        self.text_widget.tag_configure("fmt_big", font=big_font)
+        self.text_widget.tag_configure("fmt_small", font=small_font)
+        self.text_widget.tag_configure("fmt_title", font=title_font, spacing1=3, spacing3=3)
+
+    def _build_toolbar(self) -> None:
+        buttons = [
+            ("B", "Ctrl+B", lambda: self._toggle_style("fmt_bold")),
+            ("I", "Ctrl+I", lambda: self._toggle_style("fmt_italic")),
+            ("U", "Ctrl+U", lambda: self._toggle_style("fmt_underline")),
+            ("S", "Ctrl+Shift+X", lambda: self._toggle_style("fmt_strike")),
+            ("`", "Ctrl+E", lambda: self._toggle_style("fmt_code")),
+            ("H", "Ctrl+H", lambda: self._toggle_style("fmt_highlight")),
+            ("Img", "Insertar imagen", self._insert_image_dialog),
+            ("A+", "Ctrl++", lambda: self._toggle_style("fmt_big")),
+            ("A-", "Ctrl+-", lambda: self._toggle_style("fmt_small")),
+            ("T", "Titulo", lambda: self._toggle_style("fmt_title")),
+        ]
+        for label, hint, command in buttons[:7]:
+            self._toolbar_button(label, hint, command).pack(side="left", padx=1, pady=1)
+        more = self._toolbar_button("...", "Mas opciones", self._open_toolbar_more)
+        more.pack(side="left", padx=1, pady=1)
+        self.more_button = more
+        self.toolbar_more = tk.Menu(self.root, tearoff=0)
+        for label, hint, command in buttons[6:]:
+            self.toolbar_more.add_command(label=f"{label}  {hint}", command=command)
+        self.toolbar_more.add_separator()
+        self.toolbar_more.add_command(label="Color texto...", command=self._set_fg_color)
+        self.toolbar_more.add_command(label="Color fondo...", command=self._set_bg_color)
+        self.toolbar_more.add_command(label="Cambiar fuente...", command=self._set_font)
+        self.toolbar_more.add_command(label="Insertar imagen/GIF...", command=self._insert_image_dialog)
+        self.toolbar_more.add_command(label="Guardar como .txt/.md...", command=self._export_note_dialog)
+        self.toolbar_more.add_command(label="Limpiar formato", command=self._clear_selection_format)
+
+    def _toolbar_button(self, label: str, hint: str, command) -> tk.Button:
+        button = tk.Button(
+            self.toolbar,
+            text=label,
+            command=command,
+            width=max(2, min(4, len(label))),
+            height=1,
+            padx=2,
+            pady=0,
+            bd=0,
+            relief="flat",
+            bg="#dddddd",
+            fg="#202020",
+            activebackground="#eeeeee",
+            cursor="hand2",
+            font=("Sans", 8, "bold"),
+            takefocus=False,
+        )
+        button.bind("<Enter>", lambda _: self._show_toolbar())
+        button.bind("<Leave>", lambda _: self._schedule_toolbar_hide())
+        button.bind("<Button-3>", lambda _: self._show_toolbar())
+        button.bind("<FocusIn>", lambda _: self._show_toolbar())
+        button.tooltip_text = hint
+        return button
+
+    def _show_toolbar(self) -> None:
+        if self.toolbar_hide_job is not None:
+            self.root.after_cancel(self.toolbar_hide_job)
+            self.toolbar_hide_job = None
+        if not self.toolbar_visible:
+            self.toolbar.pack(fill="x", side="top", before=self.toolbar_handle)
+            self.toolbar_visible = True
+            self.root.after_idle(self._reapply_click_through)
+
+    def _schedule_toolbar_hide(self) -> None:
+        if self.toolbar_hide_job is not None:
+            self.root.after_cancel(self.toolbar_hide_job)
+        self.toolbar_hide_job = self.root.after(700, self._hide_toolbar_if_idle)
+
+    def _hide_toolbar_if_idle(self) -> None:
+        self.toolbar_hide_job = None
+        widget = self.root.winfo_containing(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        if widget is not None and str(widget).startswith(str(self.toolbar)):
+            return
+        self.toolbar.pack_forget()
+        self.toolbar_visible = False
+        self.root.after_idle(self._reapply_click_through)
+
+    def _open_toolbar_more(self) -> None:
+        self._show_toolbar()
+        self.toolbar_more.tk_popup(self.more_button.winfo_rootx(), self.more_button.winfo_rooty() + self.more_button.winfo_height())
+        self.toolbar_more.grab_release()
+
+    def _bind_text_shortcuts(self) -> None:
+        self.text_widget.bind("<Control-a>", self._select_all)
+        self.text_widget.bind("<Control-A>", self._select_all)
+        self.text_widget.bind("<Control-c>", self._copy_selection)
+        self.text_widget.bind("<Control-C>", self._copy_selection)
+        self.text_widget.bind("<Control-x>", self._cut_selection)
+        self.text_widget.bind("<Control-X>", self._cut_selection)
+        self.text_widget.bind("<Control-v>", self._paste_clipboard)
+        self.text_widget.bind("<Control-V>", self._paste_clipboard)
+        self.text_widget.bind("<Control-b>", lambda _: self._shortcut_style("fmt_bold"))
+        self.text_widget.bind("<Control-i>", lambda _: self._shortcut_style("fmt_italic"))
+        self.text_widget.bind("<Control-u>", lambda _: self._shortcut_style("fmt_underline"))
+        self.text_widget.bind("<Control-e>", lambda _: self._shortcut_style("fmt_code"))
+        self.text_widget.bind("<Control-plus>", lambda _: self._shortcut_style("fmt_big"))
+        self.text_widget.bind("<Control-equal>", lambda _: self._shortcut_style("fmt_big"))
+        self.text_widget.bind("<Control-KP_Add>", lambda _: self._shortcut_style("fmt_big"))
+        self.text_widget.bind("<Control-minus>", lambda _: self._shortcut_style("fmt_small"))
+        self.text_widget.bind("<Control-KP_Subtract>", lambda _: self._shortcut_style("fmt_small"))
+        self.text_widget.bind("<Control-z>", self._safe_edit_undo)
+        self.text_widget.bind("<Control-y>", self._safe_edit_redo)
+        self.text_widget.bind("<KeyRelease>", self._apply_pending_style_to_recent_input)
+
+    def _select_all(self, _: tk.Event | None = None) -> str:
+        self.text_widget.tag_add("sel", "1.0", "end-1c")
+        self.text_widget.mark_set("insert", "end-1c")
+        self.text_widget.see("insert")
+        return "break"
+
+    def _safe_edit_undo(self, _: tk.Event | None = None) -> str:
+        try:
+            self.text_widget.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _safe_edit_redo(self, _: tk.Event | None = None) -> str:
+        try:
+            self.text_widget.edit_redo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _copy_selection(self, _: tk.Event | None = None) -> str:
+        try:
+            text = self.text_widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        return "break"
+
+    def _cut_selection(self, _: tk.Event | None = None) -> str:
+        if self.read_only:
+            return self._copy_selection()
+        try:
+            text = self.text_widget.get("sel.first", "sel.last")
+            self.text_widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._schedule_save()
+        return "break"
+
+    def _paste_clipboard(self, _: tk.Event | None = None) -> str:
+        if self.read_only:
+            return "break"
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if self._selection_bounds() is not None:
+            self.text_widget.delete("sel.first", "sel.last")
+        start = self.text_widget.index("insert")
+        self.text_widget.insert("insert", text)
+        end = self.text_widget.index("insert")
+        for tag in self.pending_style_tags:
+            self.text_widget.tag_add(tag, start, end)
+        self._schedule_save()
+        return "break"
+
+    def _shortcut_style(self, tag: str) -> str:
+        self._toggle_style(tag)
+        return "break"
+
+    def _selection_bounds(self) -> tuple[str, str] | None:
+        try:
+            return self.text_widget.index("sel.first"), self.text_widget.index("sel.last")
+        except tk.TclError:
+            return None
+
+    def _toggle_style(self, tag: str) -> None:
+        if self.read_only:
+            return
+        bounds = self._selection_bounds()
+        if bounds is None:
+            if tag in self.pending_style_tags:
+                self.pending_style_tags.remove(tag)
+                self.text_widget.tag_remove(tag, "insert", "insert")
+            else:
+                self.pending_style_tags.add(tag)
+                self.text_widget.tag_add(tag, "insert", "insert")
+            return
+        start, end = bounds
+        ranges = self.text_widget.tag_nextrange(tag, start, end)
+        if ranges and self.text_widget.compare(ranges[0], "<=", start) and self.text_widget.compare(ranges[1], ">=", end):
+            self.text_widget.tag_remove(tag, start, end)
+        else:
+            self.text_widget.tag_add(tag, start, end)
+        self._schedule_save()
+
+    def _clear_selection_format(self) -> None:
+        bounds = self._selection_bounds()
+        if bounds is None:
+            self.pending_style_tags.clear()
+            return
+        start, end = bounds
+        for tag in STYLE_TAGS:
+            self.text_widget.tag_remove(tag, start, end)
+        self._schedule_save()
+
+    def _apply_pending_style_to_recent_input(self, event: tk.Event) -> None:
+        if not self.pending_style_tags:
+            return
+        if event.keysym in {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "BackSpace", "Delete"}:
+            return
+        if not event.char and event.keysym not in {"Return", "Tab", "space"}:
+            return
+        try:
+            start = self.text_widget.index("insert-1c")
+            end = self.text_widget.index("insert")
+        except tk.TclError:
+            return
+        for tag in self.pending_style_tags:
+            self.text_widget.tag_add(tag, start, end)
+        self._schedule_save()
+
+    def _dump_format_ranges(self) -> list[dict]:
+        ranges = []
+        for tag in STYLE_TAGS:
+            tag_ranges = self.text_widget.tag_ranges(tag)
+            for idx in range(0, len(tag_ranges), 2):
+                start = str(tag_ranges[idx])
+                end = str(tag_ranges[idx + 1])
+                if self.text_widget.compare(start, "<", end):
+                    ranges.append({"tag": tag, "start": self._index_to_offset(start), "end": self._index_to_offset(end)})
+        return ranges
+
+    def _restore_format_ranges(self, ranges: list[dict]) -> None:
+        text_end = self.text_widget.index("end-1c")
+        for item in ranges:
+            tag = item.get("tag")
+            if tag not in STYLE_TAGS:
+                continue
+            try:
+                start = self._offset_to_index(int(item.get("start", 0)))
+                end = self._offset_to_index(int(item.get("end", 0)))
+            except (TypeError, ValueError, tk.TclError):
+                continue
+            if self.text_widget.compare(start, ">=", text_end) or self.text_widget.compare(start, ">=", end):
+                continue
+            if self.text_widget.compare(end, ">", text_end):
+                end = text_end
+            self.text_widget.tag_add(tag, start, end)
+
+    def _index_to_offset(self, index: str) -> int:
+        return int(self.text_widget.tk.call(self.text_widget._w, "count", "-chars", "1.0", index))
+
+    def _offset_to_index(self, offset: int) -> str:
+        return self.text_widget.index(f"1.0+{max(0, offset)}c")
+
+    def _insert_image_dialog(self) -> None:
+        if self.read_only:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Insertar imagen o GIF",
+            filetypes=[
+                ("Imagenes", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
+                ("Todos los archivos", "*"),
+            ],
+        )
+        if not path:
+            return
+        self._add_image_from_path(path)
+
+    def _add_image_from_path(self, path: str, x: int = 16, y: int | None = None, quiet: bool = False) -> bool:
+        try:
+            image = FloatingImage.from_file(self, path, x=x, y=y if y is not None else max(22, 8 + (24 if self.toolbar_visible else 0)))
+        except Exception:
+            if not quiet:
+                messagebox.showerror("Imagen no valida", "No se pudo insertar esa imagen.", parent=self.root)
+            return False
+        self.images.append(image)
+        image.frame.lift()
+        self._refresh_opacity_for_pointer()
+        self._schedule_save()
+        self._reapply_click_through()
+        return True
+
+    def _restore_images(self, records: list[dict]) -> None:
+        for record in records:
+            try:
+                image = FloatingImage(self, record)
+            except Exception:
+                continue
+            self.images.append(image)
+        if self.images:
+            self.root.after_idle(self._refresh_opacity_for_pointer)
+
+    def _dump_images(self) -> list[dict]:
+        return [image.to_record() for image in self.images]
+
+    def send_image_back(self, image: FloatingImage) -> None:
+        if image not in self.images:
+            return
+        image.frame.lift(self.text_widget)
+        for other in self.images:
+            if other is not image:
+                other.frame.lift(image.frame)
+        self._reapply_click_through()
+
     def _build_context_menu(self) -> None:
         self.context_menu.delete(0, "end")
         self.context_menu.add_command(label="Nueva nota vacia", command=self._spawn_empty_note)
         self.context_menu.add_command(label="Duplicar nota", command=self._duplicate_note)
 
         hist = tk.Menu(self.context_menu, tearoff=0)
+        recent_notes = get_recent_notes()
+        if recent_notes:
+            for record in recent_notes[:12]:
+                hist.add_command(label=self._history_menu_label(record), command=lambda rec=record: spawn_note_from_record(rec))
+            hist.add_separator()
+        else:
+            hist.add_command(label="Sin historial", state="disabled")
+            hist.add_separator()
         hist.add_command(label="Restaurar 2 recientes", command=lambda: handle_restore_option("2"))
         hist.add_command(label="Restaurar N...", command=lambda: handle_restore_option("prompt"))
         hist.add_command(label="Restaurar todas", command=lambda: handle_restore_option("all"))
@@ -318,6 +1150,8 @@ class GhostNote:
 
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Limpiar texto", command=lambda: self.text_widget.delete("1.0", "end"))
+        self.context_menu.add_command(label="Insertar imagen/GIF...", command=self._insert_image_dialog)
+        self.context_menu.add_command(label="Guardar como .txt/.md...", command=self._export_note_dialog)
         self.context_menu.add_command(label="Editar ancho/alto", command=self._set_custom_size)
         self.context_menu.add_command(label="Fuente (+)", command=lambda: self._bump_font(1))
         self.context_menu.add_command(label="Fuente (-)", command=lambda: self._bump_font(-1))
@@ -335,45 +1169,175 @@ class GhostNote:
         color_menu.add_command(label="Color de texto", command=self._set_fg_color)
         self.context_menu.add_cascade(label="Colores", menu=color_menu)
 
+        style_menu = tk.Menu(self.context_menu, tearoff=0)
+        style_menu.add_command(label="Negrita", command=lambda: self._toggle_style("fmt_bold"))
+        style_menu.add_command(label="Italica", command=lambda: self._toggle_style("fmt_italic"))
+        style_menu.add_command(label="Subrayado", command=lambda: self._toggle_style("fmt_underline"))
+        style_menu.add_command(label="Tachado", command=lambda: self._toggle_style("fmt_strike"))
+        style_menu.add_command(label="Codigo", command=lambda: self._toggle_style("fmt_code"))
+        style_menu.add_command(label="Resaltado", command=lambda: self._toggle_style("fmt_highlight"))
+        style_menu.add_command(label="Titulo", command=lambda: self._toggle_style("fmt_title"))
+        style_menu.add_separator()
+        style_menu.add_command(label="Insertar imagen/GIF...", command=self._insert_image_dialog)
+        style_menu.add_command(label="Limpiar formato", command=self._clear_selection_format)
+        self.context_menu.add_cascade(label="Formato", menu=style_menu)
+
         self.topmost_var = tk.BooleanVar(value=bool(self.root.attributes("-topmost")))
         self.context_menu.add_checkbutton(label="Siempre encima", variable=self.topmost_var, command=self._toggle_topmost)
         self.read_only_var = tk.BooleanVar(value=bool(self.read_only))
         self.context_menu.add_checkbutton(label="Bloquear edicion", variable=self.read_only_var, command=self._toggle_read_only)
+        self.click_through_var = tk.BooleanVar(value=bool(self.click_through))
+        self.context_menu.add_checkbutton(label="Dejar pasar clics", variable=self.click_through_var, command=self._toggle_click_through)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Cerrar nota", command=self._close)
 
     def _open_context_menu(self, event: tk.Event) -> None:
         self._build_context_menu()
-        self.context_menu.tk_popup(event.x_root, event.y_root)
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+        return "break"
+
+    def _history_menu_label(self, record: dict) -> str:
+        text = " ".join(str(record.get("text", "")).split())
+        image_count = len(record.get("images", []) or [])
+        if not text:
+            text = f"{image_count} imagen(es)" if image_count else "Nota vacia"
+        if len(text) > 44:
+            text = text[:41].rstrip() + "..."
+        updated = int(record.get("updated_at", 0) or 0)
+        stamp = time.strftime("%d/%m %H:%M", time.localtime(updated)) if updated else "sin fecha"
+        return f"{stamp}  {text}"
 
     def _spawn_empty_note(self) -> None:
         subprocess.Popen([sys.executable, __file__], start_new_session=True)
 
     def _duplicate_note(self) -> None:
-        subprocess.Popen(
-            [
-                sys.executable,
-                __file__,
-                "--width",
-                str(self.root.winfo_width()),
-                "--height",
-                str(self.root.winfo_height()),
-                "--active-opacity",
-                str(self.active_opacity),
-                "--idle-opacity",
-                str(self.idle_opacity),
-                "--bg",
-                self.bg,
-                "--fg",
-                self.fg,
-                "--font-size",
-                str(self.font_size),
-                "--font-family",
-                self.font_family,
-                self.text_widget.get("1.0", "end-1c"),
+        cmd = [
+            sys.executable,
+            __file__,
+            "--width",
+            str(self.root.winfo_width()),
+            "--height",
+            str(self.root.winfo_height()),
+            "--active-opacity",
+            str(self.active_opacity),
+            "--idle-opacity",
+            str(self.idle_opacity),
+            "--bg",
+            self.bg,
+            "--fg",
+            self.fg,
+            "--font-size",
+            str(self.font_size),
+            "--font-family",
+            self.font_family,
+            "--format-json",
+            json.dumps(self._dump_format_ranges(), ensure_ascii=False),
+            "--images-json",
+            json.dumps(self._dump_images(), ensure_ascii=False),
+        ]
+        if self.click_through:
+            cmd.append("--click-through")
+        cmd.append(self.text_widget.get("1.0", "end-1c"))
+        subprocess.Popen(cmd, start_new_session=True)
+
+    def _export_note_dialog(self) -> None:
+        self._save_now()
+        initial = self._suggest_export_name()
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Guardar notita",
+            initialfile=initial,
+            defaultextension=".md",
+            filetypes=[
+                ("Markdown", "*.md"),
+                ("Texto plano", "*.txt"),
             ],
-            start_new_session=True,
         )
+        if not path:
+            return
+        target = Path(path).expanduser()
+        if target.suffix.lower() not in {".md", ".txt"}:
+            target = target.with_suffix(".md")
+        try:
+            self._export_note_to_path(target)
+        except OSError as exc:
+            messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
+            return
+        messagebox.showinfo("Notita guardada", f"Guardada en:\n{target}", parent=self.root)
+
+    def _suggest_export_name(self) -> str:
+        text = " ".join(self.text_widget.get("1.0", "end-1c").split())
+        if not text:
+            text = "notita"
+        return f"{self._safe_filename(text[:32])}.md"
+
+    def _export_note_to_path(self, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = self.text_widget.get("1.0", "end-1c").rstrip()
+        images = self._dump_images()
+        if target.suffix.lower() == ".txt":
+            content = self._export_as_text(text, images)
+        else:
+            content = self._export_as_markdown(target, text, images)
+        target.write_text(content, encoding="utf-8")
+
+    def _export_as_text(self, text: str, images: list[dict]) -> str:
+        lines = [text] if text else []
+        if images:
+            if lines:
+                lines.append("")
+            lines.append("Imagenes:")
+            for image in images:
+                name = str(image.get("name") or "imagen")
+                source = str(image.get("store_path") or image.get("path") or "")
+                lines.append(f"- {name}: {source}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _export_as_markdown(self, target: Path, text: str, images: list[dict]) -> str:
+        parts = [text] if text else []
+        links = []
+        if images:
+            assets_dir = target.parent / f"{target.stem}_assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            used_names: set[str] = set()
+            for image in images:
+                source = Path(str(image.get("store_path") or image.get("path") or ""))
+                if not source.is_file():
+                    continue
+                base_name = self._safe_filename(str(image.get("name") or source.name))
+                if not Path(base_name).suffix:
+                    base_name += source.suffix or ".img"
+                dest_name = self._unique_asset_name(base_name, used_names)
+                used_names.add(dest_name)
+                dest = assets_dir / dest_name
+                shutil.copy2(source, dest)
+                rel = dest.relative_to(target.parent).as_posix()
+                alt = str(image.get("name") or dest_name).replace("]", "")
+                links.append(f"![{alt}]({rel})")
+        if links:
+            if parts:
+                parts.append("")
+            parts.append("## Imagenes")
+            parts.extend(links)
+        return "\n\n".join(parts).rstrip() + "\n"
+
+    def _unique_asset_name(self, name: str, used_names: set[str]) -> str:
+        candidate = name
+        stem = Path(name).stem or "imagen"
+        suffix = Path(name).suffix
+        idx = 2
+        while candidate in used_names:
+            candidate = f"{stem}-{idx}{suffix}"
+            idx += 1
+        return candidate
+
+    def _safe_filename(self, value: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value.strip())
+        safe = safe.strip("._")
+        return safe or "notita"
 
     def _set_custom_size(self) -> None:
         w = simpledialog.askinteger("Ancho", "Nuevo ancho:", initialvalue=self.root.winfo_width(), minvalue=140, maxvalue=2400)
@@ -390,6 +1354,7 @@ class GhostNote:
         current = int(font_obj.cget("size"))
         self.font_size = max(7, min(24, current + delta))
         self.text_widget.configure(font=(self.font_family, self.font_size))
+        self._configure_text_tags()
         self._schedule_save()
 
     def _set_font(self) -> None:
@@ -417,6 +1382,7 @@ class GhostNote:
         self.font_family = family.strip() or current_family
         self.font_size = int(size)
         self.text_widget.configure(font=(self.font_family, self.font_size))
+        self._configure_text_tags()
         self._schedule_save()
 
     def _clear_history_with_confirm(self) -> None:
@@ -433,7 +1399,7 @@ class GhostNote:
     def _shift_opacity(self, idle_delta: float, active_delta: float) -> None:
         self.idle_opacity = max(0.05, min(0.9, self.idle_opacity + idle_delta))
         self.active_opacity = max(self.idle_opacity, min(1.0, self.active_opacity + active_delta))
-        self.root.attributes("-alpha", self.active_opacity)
+        self._refresh_opacity_for_pointer()
         self._schedule_save()
 
     def _set_active_opacity(self) -> None:
@@ -441,7 +1407,7 @@ class GhostNote:
         if value is None:
             return
         self.active_opacity = max(self.idle_opacity, min(1.0, value))
-        self.root.attributes("-alpha", self.active_opacity)
+        self._refresh_opacity_for_pointer()
         self._schedule_save()
 
     def _set_idle_opacity(self) -> None:
@@ -449,7 +1415,7 @@ class GhostNote:
         if value is None:
             return
         self.idle_opacity = max(0.05, min(self.active_opacity, value))
-        self.root.attributes("-alpha", self.idle_opacity)
+        self._refresh_opacity_for_pointer()
         self._schedule_save()
 
     def _set_bg_color(self) -> None:
@@ -482,6 +1448,74 @@ class GhostNote:
             self.text_widget.focus_force()
             self.text_widget.mark_set("insert", "end")
         self._schedule_save()
+
+    def _toggle_click_through(self) -> None:
+        self._set_click_through(bool(self.click_through_var.get()))
+
+    def _set_click_through(self, enabled: bool, persist: bool = True) -> bool:
+        enabled = bool(enabled)
+        previous_click_through = self.click_through
+        previous_frameless = self.frameless
+
+        if enabled and not self.input_shape.available:
+            self.click_through = False
+            if hasattr(self, "click_through_var"):
+                self.click_through_var.set(False)
+            if persist:
+                self._schedule_save()
+            return False
+
+        target_frameless = bool(self.requested_frameless or enabled)
+        if target_frameless != self.frameless:
+            self.frameless = target_frameless
+            self.root.overrideredirect(target_frameless)
+            self.root.update_idletasks()
+            if target_frameless:
+                self.root.lift()
+
+        if enabled:
+            if self._apply_click_through():
+                self.click_through = True
+                self.has_custom_input_shape = True
+                self.root.after(160, self._reapply_click_through)
+                self.root.after(500, self._reapply_click_through)
+            else:
+                self.click_through = previous_click_through
+                self.frameless = previous_frameless
+                self.root.overrideredirect(previous_frameless)
+                self.root.update_idletasks()
+                enabled = False
+        else:
+            if self.has_custom_input_shape:
+                self.input_shape.set_passthrough(self.root, False)
+            self.click_through = False
+        if hasattr(self, "click_through_var"):
+            self.click_through_var.set(self.click_through)
+        if persist:
+            self._schedule_save()
+        return enabled and self.click_through
+
+    def _apply_click_through(self) -> bool:
+        control_widgets = self._click_through_control_widgets()
+        if self.input_shape.set_passthrough(self.root, True, control_widgets):
+            self._set_opacity(self.idle_opacity)
+            return True
+        return False
+
+    def _click_through_control_widgets(self) -> set[tk.Misc]:
+        widgets = {self.move_grip, self.resize_grip, self.toolbar_handle}
+        if self.toolbar_visible:
+            widgets.add(self.toolbar)
+            widgets.update(self.toolbar.winfo_children())
+        for image in self.images:
+            widgets.add(image.frame)
+            widgets.add(image.label)
+            widgets.add(image.grip)
+        return widgets
+
+    def _reapply_click_through(self) -> None:
+        if self.click_through:
+            self._apply_click_through()
 
     def _start_drag(self, event: tk.Event) -> None:
         self.drag_start = (event.x_root, event.y_root)
@@ -517,6 +1551,12 @@ class GhostNote:
             self.text_widget.edit_modified(False)
             self._schedule_save()
 
+    def _on_configure(self, _: tk.Event) -> None:
+        self._schedule_save()
+        self.root.after_idle(self._refresh_opacity_for_pointer)
+        if self.click_through:
+            self.root.after_idle(self._reapply_click_through)
+
     def _schedule_save(self) -> None:
         if self._save_job is not None:
             self.root.after_cancel(self._save_job)
@@ -525,7 +1565,8 @@ class GhostNote:
     def _save_now(self) -> None:
         self._save_job = None
         text_value = self.text_widget.get("1.0", "end-1c")
-        if not text_value.strip():
+        image_records = self._dump_images()
+        if not text_value.strip() and not image_records:
             delete_note_record(self.note_id)
             return
         rec = {
@@ -543,6 +1584,9 @@ class GhostNote:
             "font_family": self.font_family,
             "topmost": bool(self.root.attributes("-topmost")),
             "read_only": bool(self.read_only),
+            "click_through": bool(self.click_through),
+            "format": self._dump_format_ranges(),
+            "images": image_records,
             "updated_at": int(time.time()),
         }
         upsert_note_record(rec)

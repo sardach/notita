@@ -43,6 +43,10 @@ Crear una utilidad invocable por comando/atajo para capturar texto rápido y mos
 - Cada cambio se guarda en historial local para restauracion posterior.
 - Posicion de apertura: cerca del cursor; fallback al centro de la pantalla.
 - Tamano inicial por defecto minimo para nota vacia: `140x70`.
+- Imagenes: se pueden insertar desde el menu, desde la barra o soltandolas sobre
+  la nota desde el gestor de archivos.
+- Exportacion: menu contextual -> `Guardar como .txt/.md...`. En `.md` las
+  imagenes se copian a una carpeta `NOMBRE_assets` junto al archivo exportado.
 
 ## Historial y restauracion
 - Archivo de estado: `~/.local/state/notita/history.json`
@@ -56,6 +60,8 @@ Crear una utilidad invocable por comando/atajo para capturar texto rápido y mos
   - topmost
 - No se guardan notas vacias: si el texto queda vacio, se elimina del historial.
 - Al restaurar, cada nota reaparece en su lugar/tamano guardado.
+- El menu `Historial` muestra las 12 notas recientes con fecha y vista previa;
+  seleccionar una entrada la abre/restaura directamente.
 
 Comandos:
 ```bash
@@ -69,11 +75,14 @@ notita --restore all      # restaura todas
 - Nueva nota vacia
 - Duplicar nota
 - Historial:
+  - Lista de notas recientes abribles con un clic
   - Restaurar 2 recientes
   - Restaurar N...
   - Restaurar todas
   - Limpiar historial (confirmacion escribiendo `LIMPIAR`)
 - Limpiar texto
+- Insertar imagen/GIF...
+- Guardar como .txt/.md...
 - Editar ancho/alto
 - Fuente (+) / Fuente (-)
 - Cambiar fuente... (familia y tamano)
