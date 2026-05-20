@@ -66,3 +66,7 @@ instalador la crea si falta y el wrapper `notita` la usa automaticamente.
 Atajos utiles dentro del texto: `Ctrl+A` selecciona todo, `Ctrl+C/X/V` copia,
 corta y pega, `Ctrl+B/I/U` alterna negrita, italica y subrayado, `Ctrl+E`
 alterna codigo, y `Ctrl+Z/Y` hace undo/redo.
+
+## Licencia
+
+GPL-3.0-or-later. Ver [LICENSE](LICENSE).
